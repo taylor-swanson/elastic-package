@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elastic/elastic-package/internal/common"
 	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/pkg/errors"
 )
@@ -85,6 +86,15 @@ type TestResult struct {
 	// If the test was skipped, the reason it was skipped and a link for more
 	// details.
 	Skipped *SkipConfig
+
+	// Events produced by the test.
+	Events Events
+}
+
+type Events []common.MapStr
+
+type TestExpectedResult struct {
+	Expected Events `json:"expected"`
 }
 
 // ResultComposer wraps a TestResult and provides convenience methods for

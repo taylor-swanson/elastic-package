@@ -14,7 +14,6 @@ import (
 	"github.com/aymerick/raymond"
 	"github.com/pkg/errors"
 
-	"github.com/elastic/go-ucfg"
 	"github.com/elastic/go-ucfg/yaml"
 
 	"github.com/elastic/elastic-package/internal/packages"
@@ -37,12 +36,16 @@ type testConfig struct {
 		Vars map[string]packages.VarValue `config:"vars"`
 	} `config:"data_stream"`
 
+	DynamicFields map[string]string      `config:"dynamic_fields"`
+
 	// NumericKeywordFields holds a list of fields that have keyword
 	// type but can be ingested as numeric type.
 	NumericKeywordFields []string `config:"numeric_keyword_fields"`
 
 	Path               string
 	ServiceVariantName string
+
+	VerifyResults bool `config:"verify_results"`
 }
 
 func (t testConfig) Name() string {
@@ -78,7 +81,7 @@ func newConfig(configFilePath string, ctxt servicedeployer.ServiceContext, servi
 	}
 
 	var c testConfig
-	cfg, err := yaml.NewConfig(data, ucfg.PathSep("."))
+	cfg, err := yaml.NewConfig(data)
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to load system test configuration file: %s", configFilePath)
 	}

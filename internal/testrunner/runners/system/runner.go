@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -216,6 +217,20 @@ func (r *runner) runTestPerVariant(result *testrunner.ResultComposer, locationMa
 	if err != nil {
 		return partial, err
 	}
+	if testConfig.VerifyResults {
+		logger.Infof("Verifying test results for %s/%s...", r.options.TestFolder.Package, r.options.TestFolder.DataStream)
+		fieldsValidator, err := fields.CreateValidatorForDataStream(dataStreamPath,
+			fields.WithNumericKeywordFields(testConfig.NumericKeywordFields))
+		if err != nil {
+			return nil, errors.Wrapf(err, "creating fields validator for data stream failed (path: %s, test case file: %s)", dataStreamPath, cfgFile)
+		}
+		for _, partialResult := range partial {
+			logger.Infof("Docs for partial (%s): %d", partialResult.Name, len(partialResult.Events))
+			if vErr := r.verifyResults(cfgFile, testConfig, partialResult, fieldsValidator); vErr != nil {
+				return partial, vErr
+			}
+		}
+	}
 	if tdErr != nil {
 		return partial, errors.Wrap(tdErr, "failed to tear down runner")
 	}
@@ -226,10 +241,10 @@ func createTestRunID() string {
 	return fmt.Sprintf("%d", rand.Intn(testRunMaxID-testRunMinID)+testRunMinID)
 }
 
-func (r *runner) getDocs(dataStream string) ([]common.MapStr, error) {
+func (r *runner) getEvents(dataStream string) (testrunner.Events, error) {
 	resp, err := r.options.ESClient.Search(
 		r.options.ESClient.Search.WithIndex(dataStream),
-		r.options.ESClient.Search.WithSort("@timestamp:asc"),
+		r.options.ESClient.Search.WithSort("event.ingested:asc"),
 		r.options.ESClient.Search.WithSize(elasticsearchQuerySize),
 	)
 	if err != nil {
@@ -255,12 +270,12 @@ func (r *runner) getDocs(dataStream string) ([]common.MapStr, error) {
 	numHits := results.Hits.Total.Value
 	logger.Debugf("found %d hits in %s data stream", numHits, dataStream)
 
-	var docs []common.MapStr
+	var events testrunner.Events
 	for _, hit := range results.Hits.Hits {
-		docs = append(docs, hit.Source)
+		events = append(events, hit.Source)
 	}
 
-	return docs, nil
+	return events, nil
 }
 
 func (r *runner) runTest(config *testConfig, ctxt servicedeployer.ServiceContext, serviceOptions servicedeployer.FactoryOptions) ([]testrunner.TestResult, error) {
@@ -373,7 +388,7 @@ func (r *runner) runTest(config *testConfig, ctxt servicedeployer.ServiceContext
 			return true, errors.New("SIGINT: cancel clearing data")
 		}
 
-		docs, err := r.getDocs(dataStream)
+		docs, err := r.getEvents(dataStream)
 		return len(docs) == 0, err
 	}, 2*time.Minute)
 	if err != nil || !cleared {
@@ -417,15 +432,14 @@ func (r *runner) runTest(config *testConfig, ctxt servicedeployer.ServiceContext
 
 	// (TODO in future) Optionally exercise service to generate load.
 	logger.Debug("checking for expected data in data stream...")
-	var docs []common.MapStr
 	passed, err := waitUntilTrue(func() (bool, error) {
 		if signal.SIGINT() {
 			return true, errors.New("SIGINT: cancel waiting for policy assigned")
 		}
 
 		var err error
-		docs, err = r.getDocs(dataStream)
-		return len(docs) > 0, err
+		result.Events, err = r.getEvents(dataStream)
+		return len(result.Events) > 0, err
 	}, waitForDataTimeout)
 
 	if err != nil {
@@ -443,7 +457,7 @@ func (r *runner) runTest(config *testConfig, ctxt servicedeployer.ServiceContext
 		return result.WithError(errors.Wrapf(err, "creating fields validator for data stream failed (path: %s)", serviceOptions.DataStreamRootPath))
 	}
 
-	if err := validateFields(docs, fieldsValidator, dataStream); err != nil {
+	if err := validateFields(result.Events, fieldsValidator, dataStream); err != nil {
 		return result.WithError(err)
 	}
 
@@ -451,7 +465,7 @@ func (r *runner) runTest(config *testConfig, ctxt servicedeployer.ServiceContext
 	if r.options.GenerateTestResult {
 		ds := r.options.TestFolder.DataStream
 		dsPath := filepath.Join(r.options.PackageRootPath, "data_stream", ds)
-		if err := writeSampleEvent(dsPath, docs[0]); err != nil {
+		if err := writeSampleEvent(dsPath, result.Events[0]); err != nil {
 			return result.WithError(errors.Wrap(err, "failed to write sample event file"))
 		}
 	}
@@ -512,7 +526,6 @@ func createPackageDatastream(
 			Enabled: true,
 		},
 	}
-
 	streams := []kibana.Stream{
 		{
 			ID:      fmt.Sprintf("%s-%s.%s", streamInput, pkg.Name, ds.Name),
@@ -648,18 +661,16 @@ func writeSampleEvent(path string, doc common.MapStr) error {
 	return nil
 }
 
-func validateFields(docs []common.MapStr, fieldsValidator *fields.Validator, dataStream string) error {
+func validateFields(events testrunner.Events, fieldsValidator *fields.Validator, dataStream string) error {
 	var multiErr multierror.Error
-	for _, doc := range docs {
-		if message, err := doc.GetValue("error.message"); err != common.ErrKeyNotFound {
+	for _, event := range events {
+		if message, err := event.GetValue("error.message"); err != common.ErrKeyNotFound {
 			multiErr = append(multiErr, fmt.Errorf("found error.message in event: %v", message))
 			continue
 		}
-
-		errs := fieldsValidator.ValidateDocumentMap(doc)
+		errs := fieldsValidator.ValidateDocumentMap(event)
 		if errs != nil {
 			multiErr = append(multiErr, errs...)
-			continue
 		}
 	}
 
@@ -687,4 +698,94 @@ func (r *runner) selectVariants(variantsFile *servicedeployer.VariantsFile) []st
 		variantNames = append(variantNames, k)
 	}
 	return variantNames
+}
+
+func (r *runner) verifyResults(testCaseFile string, config *testConfig, result testrunner.TestResult, fieldsValidator *fields.Validator) error {
+	testCasePath := filepath.Join(r.options.TestFolder.Path, testCaseFile)
+
+	if r.options.GenerateTestResult {
+		if err := writeTestResult(testCasePath, result.Events); err != nil {
+			return errors.Wrap(err, "unable to write test result")
+		}
+	}
+
+	err := diffEvents(testCasePath, config, result.Events)
+	if _, ok := err.(testrunner.ErrTestCaseFailed); ok {
+		return err
+	}
+	if err != nil {
+		return errors.Wrap(err, "comparing test results failed")
+	}
+
+	if err = verifyDynamicFields(result.Events, config); err != nil {
+		return err
+	}
+
+	if err = verifyFieldsInTestResult(result.Events, fieldsValidator); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func verifyDynamicFields(events testrunner.Events, config *testConfig) error {
+	if config == nil || config.DynamicFields == nil {
+		return nil
+	}
+
+	var multiErr multierror.Error
+	for _, event := range events {
+		for key, pattern := range config.DynamicFields {
+			val, err := event.GetValue(key)
+			if err != nil && err != common.ErrKeyNotFound {
+				return errors.Wrap(err, "unable to remove dynamic field")
+			}
+
+			valStr, ok := val.(string)
+			if !ok {
+				continue // regular expressions can be verify only string values
+			}
+
+			matched, err := regexp.MatchString(pattern, valStr)
+			if err != nil {
+				return errors.Wrapf(err, "unable to pattern match dynamic field pattern %q", pattern)
+			}
+
+			if !matched {
+				multiErr = append(multiErr, fmt.Errorf("dynamic field %q doesn't match the pattern (%s): %s",
+					key, pattern, valStr))
+			}
+		}
+	}
+
+	if len(multiErr) > 0 {
+		return testrunner.ErrTestCaseFailed{
+			Reason:  "one or more problems with dynamic fields found in documents",
+			Details: multiErr.Unique().Error(),
+		}
+	}
+	return nil
+}
+
+func verifyFieldsInTestResult(result testrunner.Events, fieldsValidator *fields.Validator) error {
+	var multiErr multierror.Error
+	for _, event := range result {
+		if message, err := event.GetValue("error.message"); err != common.ErrKeyNotFound {
+			multiErr = append(multiErr, fmt.Errorf("found error.message in event: %v", message))
+			continue
+		}
+
+		errs := fieldsValidator.ValidateDocumentMap(event)
+		if errs != nil {
+			multiErr = append(multiErr, errs...)
+		}
+	}
+
+	if len(multiErr) > 0 {
+		return testrunner.ErrTestCaseFailed{
+			Reason:  "one or more problems with fields found in documents",
+			Details: multiErr.Unique().Error(),
+		}
+	}
+	return nil
 }
